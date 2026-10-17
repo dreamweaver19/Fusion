@@ -77,6 +77,47 @@ def format_semester_display(semester_no, semester_type=None, semester_label=None
     else:
         return str(semester_no)
 
+
+def get_expected_completion_year(student):
+    """
+    Dynamically compute the calendar year in which the student's final-semester
+    result is expected to be declared (July/August of that year).
+
+    Source of truth:
+      - student.batch_id.year          → admission year (e.g. 2023 for UG2023)
+      - student.batch_id.curriculum.no_of_semester
+                                       → total semesters in the programme
+                                         (8 for B.Tech, 4 for M.Tech, etc.)
+
+    Formula:
+      duration_years = no_of_semester // 2   (2 semesters per academic year)
+      expected_completion_year = admission_year + duration_years
+
+    Examples:
+      UG2023 B.Tech  (8 sems)  → 2023 + 4 = 2027
+      UG2024 B.Tech  (8 sems)  → 2024 + 4 = 2028
+      UG2023 M.Tech  (4 sems)  → 2023 + 2 = 2025
+
+    Returns an int, or None if the required data is not available.
+    """
+    try:
+        batch = student.batch_id
+        if batch and batch.curriculum_id:
+            # Access the curriculum FK; use batch.curriculum to get no_of_semester.
+            # Re-fetch only if the related object isn't already cached.
+            curriculum = batch.curriculum
+            if curriculum and curriculum.no_of_semester:
+                duration_years = curriculum.no_of_semester // 2
+                return int(batch.year) + duration_years
+        # Fallback: batch.curriculum is null — use legacy Student.batch integer
+        # and assume B.Tech (8 semesters = 4 years) as a safe default.
+        if hasattr(student, 'batch') and student.batch:
+            return int(student.batch) + 4
+    except Exception:
+        pass
+    return None
+
+
 def round_from_last_decimal(number, decimal_places=1):
     d = Decimal(str(number))
     return Decimal(d).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)
@@ -1108,7 +1149,9 @@ class GenerateTranscript(APIView):
             "department": student.id.department.name if student.id.department else "",
             "semester": student.curr_semester_no,
             "academicYear": academic_year or "",
-            "academic_year": academic_year or ""
+            "academic_year": academic_year or "",
+            # Dynamic expected completion year (e.g. UG2023 B.Tech → 2027)
+            "expected_completion_year": get_expected_completion_year(student),
         }
 
         response_data = {
@@ -2559,7 +2602,53 @@ class GeneratePDFAPI(APIView):
             
             story.append(summary_table)
             story.append(Spacer(1, 25))
-            
+
+            # Certificate sentence — expected final-semester result declaration
+            # Only included when the expected completion year can be determined from
+            # the student's batch / curriculum data.  Never hardcoded.
+            completion_year = student_info.get("expected_completion_year")
+            final_sem_no = student_info.get("final_sem_no")  # optionally passed
+            if not final_sem_no:
+                # Derive from no_of_semester via student object when called from DB path.
+                # When called from the frontend-payload path, student_info should carry it.
+                try:
+                    _roll = student_info.get("rollNumber") or student_info.get("roll_number")
+                    if _roll:
+                        _stu = Student.objects.filter(id_id=_roll).select_related(
+                            "batch_id__curriculum"
+                        ).first()
+                        if _stu and _stu.batch_id and _stu.batch_id.curriculum:
+                            final_sem_no = _stu.batch_id.curriculum.no_of_semester
+                            if not completion_year:
+                                completion_year = get_expected_completion_year(_stu)
+                except Exception:
+                    pass
+            if not final_sem_no:
+                final_sem_no = 8  # safe default for B.Tech
+
+            # Build the ordinal label for the final semester (e.g. "8th", "4th")
+            def _ordinal(n):
+                n = int(n)
+                if 11 <= (n % 100) <= 13:
+                    return f"{n}th"
+                return f"{n}{['th','st','nd','rd','th'][min(n % 10, 4)]}"
+
+            certificate_style = ParagraphStyle(
+                'Certificate',
+                parent=styles['Normal'],
+                fontSize=9,
+                alignment=1,
+                fontName='Times-Italic',
+                spaceAfter=6,
+            )
+            if completion_year:
+                story.append(Paragraph(
+                    f"It is expected that {_ordinal(final_sem_no)} semester result will be "
+                    f"declared in the month of July/August {completion_year}.",
+                    certificate_style
+                ))
+            story.append(Spacer(1, 10))
+
             # Footer
             footer_style = ParagraphStyle(
                 'Footer',
@@ -2568,7 +2657,7 @@ class GeneratePDFAPI(APIView):
                 alignment=1,  # Center
                 fontName='Times-Italic'
             )
-            
+
             from datetime import datetime
             current_date = datetime.now().strftime("%d/%m/%Y")
             story.append(Paragraph(f"This is a computer-generated document. Generated on {current_date}", footer_style))
@@ -3020,7 +3109,11 @@ class CheckResultView(APIView):
             "department": student.id.department.name if student.id.department else "",  # Backend uses department
             "semester": student.curr_semester_no,
             "academicYear": academic_year or "",  # Frontend uses camelCase
-            "academic_year": academic_year or ""   # Backend uses snake_case
+            "academic_year": academic_year or "",   # Backend uses snake_case
+            # Dynamic expected completion year — derived from batch admission year +
+            # programme duration (Curriculum.no_of_semester // 2).
+            # e.g. UG2023 B.Tech (8 sems) → 2027, UG2024 B.Tech → 2028
+            "expected_completion_year": get_expected_completion_year(student),
         }
 
         response_data = {
@@ -3554,7 +3647,9 @@ class GenerateStudentResultPDFAPI(APIView):
                     "department": student.id.department.name if student.id.department else "",
                     "semester": student.curr_semester_no,
                     "academicYear": academic_year or "",
-                    "academic_year": academic_year or ""
+                    "academic_year": academic_year or "",
+                    # Dynamic expected completion year (e.g. UG2023 B.Tech → 2027)
+                    "expected_completion_year": get_expected_completion_year(student),
                 }
 
                 # Build courses list like CheckResultView
@@ -3760,7 +3855,53 @@ class GenerateStudentResultPDFAPI(APIView):
             
             story.append(summary_table)
             story.append(Spacer(1, 25))
-            
+
+            # Certificate sentence — expected final-semester result declaration
+            # Only included when the expected completion year can be determined from
+            # the student's batch / curriculum data.  Never hardcoded.
+            completion_year = student_info.get("expected_completion_year")
+            final_sem_no = student_info.get("final_sem_no")  # optionally passed
+            if not final_sem_no:
+                # Derive from no_of_semester via student object when called from DB path.
+                # When called from the frontend-payload path, student_info should carry it.
+                try:
+                    _roll = student_info.get("rollNumber") or student_info.get("roll_number")
+                    if _roll:
+                        _stu = Student.objects.filter(id_id=_roll).select_related(
+                            "batch_id__curriculum"
+                        ).first()
+                        if _stu and _stu.batch_id and _stu.batch_id.curriculum:
+                            final_sem_no = _stu.batch_id.curriculum.no_of_semester
+                            if not completion_year:
+                                completion_year = get_expected_completion_year(_stu)
+                except Exception:
+                    pass
+            if not final_sem_no:
+                final_sem_no = 8  # safe default for B.Tech
+
+            # Build the ordinal label for the final semester (e.g. "8th", "4th")
+            def _ordinal(n):
+                n = int(n)
+                if 11 <= (n % 100) <= 13:
+                    return f"{n}th"
+                return f"{n}{['th','st','nd','rd','th'][min(n % 10, 4)]}"
+
+            certificate_style = ParagraphStyle(
+                'Certificate',
+                parent=styles['Normal'],
+                fontSize=9,
+                alignment=1,
+                fontName='Times-Italic',
+                spaceAfter=6,
+            )
+            if completion_year:
+                story.append(Paragraph(
+                    f"It is expected that {_ordinal(final_sem_no)} semester result will be "
+                    f"declared in the month of July/August {completion_year}.",
+                    certificate_style
+                ))
+            story.append(Spacer(1, 10))
+
             # Footer
             footer_style = ParagraphStyle(
                 'Footer',
@@ -3769,7 +3910,7 @@ class GenerateStudentResultPDFAPI(APIView):
                 alignment=1,  # Center
                 fontName='Times-Italic'
             )
-            
+
             from datetime import datetime
             current_date = datetime.now().strftime("%d/%m/%Y")
             story.append(Paragraph(f"This is a computer-generated document. Generated on {current_date}", footer_style))
